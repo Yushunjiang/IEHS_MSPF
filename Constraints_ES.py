@@ -3,6 +3,43 @@ from gurobipy import GRB
 import numpy as np
 
 
+def _validate_es_call(data):
+    expected_shape = (
+        data.DN.N_node,
+        data.period,
+        data.scene.N,
+        data.year,
+    )
+    alpha_ru = np.asarray(
+        getattr(data.ES, 'alpha_RU', np.zeros(expected_shape)), dtype=float
+    )
+    alpha_rd = np.asarray(
+        getattr(data.ES, 'alpha_RD', np.zeros(expected_shape)), dtype=float
+    )
+    if alpha_ru.shape != expected_shape or alpha_rd.shape != expected_shape:
+        raise ValueError('ES call coefficient shape mismatch')
+    if not np.all(np.isfinite(alpha_ru)) or not np.all(np.isfinite(alpha_rd)):
+        raise ValueError('ES call coefficients must be finite')
+    if np.any(alpha_ru < 0) or np.any(alpha_ru > 1):
+        raise ValueError('ES.alpha_RU must be within [0, 1]')
+    if np.any(alpha_rd < 0) or np.any(alpha_rd > 1):
+        raise ValueError('ES.alpha_RD must be within [0, 1]')
+    if np.any(alpha_ru + alpha_rd > 1 + 1e-9):
+        raise ValueError('ES.alpha_RU + ES.alpha_RD must not exceed 1')
+    if np.any((alpha_ru > 1e-9) & (alpha_rd > 1e-9)):
+        raise ValueError('ES.alpha_RU and ES.alpha_RD cannot both be positive')
+    power_big_m = np.asarray(getattr(data.ES, 'power_big_m', []), dtype=float)
+    expected_power_shape = (data.DN.N_node, data.year)
+    if power_big_m.shape != expected_power_shape:
+        raise ValueError('ES power big-M shape mismatch')
+    if not np.all(np.isfinite(power_big_m)) or np.any(power_big_m < 0):
+        raise ValueError('ES power big-M values must be finite and nonnegative')
+    data.ES.alpha_RU = alpha_ru
+    data.ES.alpha_RD = alpha_rd
+    data.ES.power_big_m = power_big_m
+    data.ES.call_enabled = bool(np.any(alpha_ru > 1e-9) or np.any(alpha_rd > 1e-9))
+
+
 def Constraints_ES(model, data, var, scheme=None):
     """
     储能电站 (ES) 规划与运行约束 (Python + Gurobipy 纯 for 循环实现)
@@ -10,11 +47,63 @@ def Constraints_ES(model, data, var, scheme=None):
 
     # 获取需要用到的标量常数
     r = float(data.r)
-    big_M = float(data.M)
     ES_k = float(data.ES.k)
     c_inv = float(data.ES.c_inv)
     T_build = int(data.ES.T_build)
     T_life = int(data.ES.T_life)
+    _validate_es_call(data)
+
+    for y in range(data.year):
+        for s in range(data.scene.N):
+            for t in range(data.period):
+                t_prev = t - 1 if t > 0 else data.period - 1
+                for k in data.ES.call_node_idx:
+                    alpha_ru = float(data.ES.alpha_RU[k, t, s, y])
+                    alpha_rd = float(data.ES.alpha_RD[k, t, s, y])
+                    power_big_m = float(data.ES.power_big_m[k, y])
+                    point = (k, t, s, y)
+                    previous = (k, t_prev, s, y)
+                    model.addConstr(
+                        var.ES.P_call[point]
+                        == var.ES.P[point]
+                        + alpha_ru * var.ES.P_RU[point]
+                        - alpha_rd * var.ES.P_RD[point],
+                        name=f'ES_CalledPower_{k}_{t}_{s}_{y}',
+                    )
+                    model.addConstr(
+                        var.ES.P_call[point]
+                        == var.ES.P_c_call[point] - var.ES.P_f_call[point],
+                        name=f'ES_CalledNetPower_{k}_{t}_{s}_{y}',
+                    )
+                    model.addConstr(
+                        var.ES.P_c_call[point]
+                        <= power_big_m * var.ES.X_c_call[point],
+                        name=f'ES_CalledChargeCapacity_{k}_{t}_{s}_{y}',
+                    )
+                    model.addConstr(
+                        var.ES.P_f_call[point]
+                        <= power_big_m * (1 - var.ES.X_c_call[point]),
+                        name=f'ES_CalledDischargeCapacity_{k}_{t}_{s}_{y}',
+                    )
+                    model.addConstr(
+                        var.ES.P_c_call[point] <= var.ES.S_all[k, y],
+                        name=f'ES_CalledChargeBound_{k}_{t}_{s}_{y}',
+                    )
+                    model.addConstr(
+                        var.ES.P_f_call[point] <= var.ES.S_all[k, y],
+                        name=f'ES_CalledDischargeBound_{k}_{t}_{s}_{y}',
+                    )
+                    model.addConstr(
+                        var.ES.E_call[point]
+                        == var.ES.E_call[previous]
+                        + var.ES.P_c_call[point] * ES_k
+                        - var.ES.P_f_call[point] / ES_k,
+                        name=f'ES_CalledEnergyBalance_{k}_{t}_{s}_{y}',
+                    )
+                    model.addConstr(
+                        var.ES.E_call[point] <= var.ES.E_all[k, y],
+                        name=f'ES_CalledEnergyMax_{k}_{t}_{s}_{y}',
+                    )
 
     # =========================================================================
     # 1. 规划约束 (容量建设、退役与年限)
@@ -90,12 +179,13 @@ def Constraints_ES(model, data, var, scheme=None):
                 model.addConstr(var.ES.P_RD_all[t, s, y] == gp.quicksum(var.ES.P_RD[k, t, s, y] for k in range(data.DN.N_node)), name=f"ES_PRD_all_{t}_{s}_{y}")
 
                 for k in range(data.DN.N_node):
+                    power_big_m = float(data.ES.power_big_m[k, y])
                     # a. 充放状态互斥
                     model.addConstr(var.ES.X_c[k, t, s, y] + var.ES.X_f[k, t, s, y] <= 1, name=f"ES_MutEx_{k}_{t}_{s}_{y}")
 
                     # b. 充放电功率边界约束 (大 M 松弛)
-                    model.addConstr(var.ES.P_c[k, t, s, y] <= var.ES.X_c[k, t, s, y] * big_M, name=f"ES_Pc_M_{k}_{t}_{s}_{y}")
-                    model.addConstr(var.ES.P_f[k, t, s, y] <= var.ES.X_f[k, t, s, y] * big_M, name=f"ES_Pf_M_{k}_{t}_{s}_{y}")
+                    model.addConstr(var.ES.P_c[k, t, s, y] <= var.ES.X_c[k, t, s, y] * power_big_m, name=f"ES_Pc_M_{k}_{t}_{s}_{y}")
+                    model.addConstr(var.ES.P_f[k, t, s, y] <= var.ES.X_f[k, t, s, y] * power_big_m, name=f"ES_Pf_M_{k}_{t}_{s}_{y}")
 
                     # c. 充放电功率受总容量约束
                     model.addConstr(var.ES.P_c[k, t, s, y] <= var.ES.S_all[k, y], name=f"ES_Pc_S_{k}_{t}_{s}_{y}")

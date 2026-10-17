@@ -3,10 +3,11 @@ import numpy as np
 import gurobipy as gp
 from gurobipy import GRB
 from openpyxl.utils.cell import range_boundaries
+import json
 import math
 import os
-import json
 from functools import lru_cache
+from pathlib import Path
 
 
 DIRECT_PLANNING_YEARS = 3
@@ -19,8 +20,108 @@ DEFAULT_BSS_SOC_MAX = 1.0
 DEFAULT_BSS_SERVICE_RESERVE_RATIO = 0.0
 DEFAULT_BSS_EQUIVALENT_CYCLE_LIFE = 3000.0
 
-class Struct:
 
+def _json_safe(value, _seen=None):
+    '''Recursively convert Data_read structures into JSON-safe values.'''
+    if value is None or isinstance(value, (str, bool, int)):
+        return value
+    if isinstance(value, float):
+        return value if math.isfinite(value) else None
+    if isinstance(value, np.generic):
+        return _json_safe(value.item(), _seen)
+    if isinstance(value, np.ndarray):
+        return _json_safe(value.tolist(), _seen)
+    if isinstance(value, Path):
+        return str(value)
+
+    if _seen is None:
+        _seen = set()
+
+    if isinstance(value, Struct):
+        object_id = id(value)
+        if object_id in _seen:
+            return '<recursive Struct>'
+        _seen.add(object_id)
+        result = {
+            key: _json_safe(item, _seen)
+            for key, item in vars(value).items()
+            if not key.startswith('_')
+        }
+        _seen.remove(object_id)
+        return result
+
+    if isinstance(value, dict):
+        object_id = id(value)
+        if object_id in _seen:
+            return '<recursive dict>'
+        _seen.add(object_id)
+        if all(isinstance(key, str) for key in value):
+            result = {key: _json_safe(item, _seen) for key, item in value.items()}
+        else:
+            result = [
+                {'key': str(key), 'value': _json_safe(item, _seen)}
+                for key, item in value.items()
+            ]
+        _seen.remove(object_id)
+        return result
+
+    if isinstance(value, (list, tuple, set)):
+        object_id = id(value)
+        if object_id in _seen:
+            return '<recursive sequence>'
+        _seen.add(object_id)
+        result = [_json_safe(item, _seen) for item in value]
+        _seen.remove(object_id)
+        return result
+
+    if hasattr(value, '__dict__'):
+        object_id = id(value)
+        if object_id in _seen:
+            return f'<recursive {type(value).__name__}>'
+        _seen.add(object_id)
+        result = {
+            key: _json_safe(item, _seen)
+            for key, item in vars(value).items()
+            if not key.startswith('_')
+        }
+        _seen.remove(object_id)
+        return result
+
+    return str(value)
+
+
+def export_data_json(data, output_path=None, source_filepath=None):
+    '''Write the complete Data_read data structure to a reproducible JSON file.'''
+    if output_path is None:
+        output_path = Path(__file__).resolve().parent / 'data_parameters.json'
+    else:
+        output_path = Path(output_path)
+
+    payload = {
+        'schema': 'Data_read.data.v1',
+        'source_workbook': (
+            Path(source_filepath).name if source_filepath is not None else None
+        ),
+        'data': _json_safe(data),
+    }
+
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    temp_path = output_path.with_name(output_path.name + '.tmp')
+    with temp_path.open('w', encoding='utf-8') as stream:
+        json.dump(
+            payload,
+            stream,
+            ensure_ascii=False,
+            indent=2,
+            allow_nan=False,
+        )
+        stream.write('\n')
+    os.replace(temp_path, output_path)
+    return output_path
+
+
+class Struct:
+    """通用数据结构容器类"""
     pass
 
 
@@ -35,12 +136,6 @@ def _read_excel_sheet(filepath, sheet_name):
     return pd.read_excel(filepath, sheet_name=sheet_name, header=None)
 
 
-@lru_cache(maxsize=8)
-def _read_json_parameter_file(filepath):
-    with open(filepath, "r", encoding="utf-8") as file:
-        return json.load(file)
-
-
 @lru_cache(maxsize=128)
 def _excel_range_bounds(cell_range):
     return range_boundaries(cell_range)
@@ -49,28 +144,15 @@ def _excel_range_bounds(cell_range):
 def clear_excel_read_cache():
     """Clear cached Excel sheets, useful when a workbook is edited in-process."""
     _read_excel_sheet.cache_clear()
-    _read_json_parameter_file.cache_clear()
     _excel_range_bounds.cache_clear()
 
 
 def read_excel_range(filepath, sheet_name, cell_range):
     """
-    优雅地替代 MATLAB 的 xlsread('file', 'sheet', 'range')
+    按“工作表 / 范围”读取 Excel 数据
     利用 openpyxl 解析范围，例如 "B4:U27" -> 提取对应数据并返回 numpy 数组
     """
     filepath = os.fspath(filepath)
-    if str(filepath).lower().endswith(".json"):
-        parameter_data = _read_json_parameter_file(filepath)
-        try:
-            values = parameter_data["sheets"][sheet_name][cell_range]
-        except KeyError as error:
-            raise KeyError(
-                f"Parameter JSON does not contain sheet/range: "
-                f"{sheet_name!r}/{cell_range!r}"
-            ) from error
-        return np.asarray(
-            [[np.nan if value is None else value for value in row] for row in values]
-        )
     df = _read_excel_sheet(filepath, sheet_name)
     min_col, min_row, max_col, max_row = _excel_range_bounds(cell_range)
     # 转换为 0-based 索引并切片
@@ -374,9 +456,29 @@ def _configure_hn_mccormick_parameters(data, hn_segment_count):
     hn.mccormick_envelopes_enabled = True
     hn.piecewise_partitions_enabled = segment_count > 1
 
+def _create_es_call_variables(model, data, var):
+    if hasattr(var.ES, 'P_call'):
+        return
+    # Only nodes with an existing EES or an admissible EES investment can
+    # have a nonzero called trajectory. Keeping the call state sparse avoids
+    # creating physically fixed zero variables at all other DN nodes.
+    call_indices = [
+        (node, time, scene, year)
+        for node in data.ES.call_node_idx
+        for time in range(data.period)
+        for scene in range(data.scene.N)
+        for year in range(data.year)
+    ]
+    var.ES.P_call = model.addVars(call_indices, lb=-GRB.INFINITY, vtype=GRB.CONTINUOUS, name='ES_P_call')
+    var.ES.P_c_call = model.addVars(call_indices, lb=0, vtype=GRB.CONTINUOUS, name='ES_P_c_call')
+    var.ES.P_f_call = model.addVars(call_indices, lb=0, vtype=GRB.CONTINUOUS, name='ES_P_f_call')
+    var.ES.E_call = model.addVars(call_indices, lb=0, vtype=GRB.CONTINUOUS, name='ES_E_call')
+    var.ES.X_c_call = model.addVars(call_indices, vtype=GRB.BINARY, name='ES_X_c_call')
+
+
 def Data_read(
     model,
-    filepath='parameters.json',
+    filepath='参数.xlsx',
     planning_years=DEFAULT_PLANNING_YEARS,
     create_dense_bss_transitions=True,
     hn_linearization_mode='mccormick',
@@ -412,7 +514,6 @@ def Data_read(
     # 全局与场景参数
     # =========================================================================
     data.r = 0.05  # 贴现率
-    data.M = 5e9  # 大M
     data.year = max(1, int(planning_years))  # 规划周期
     data.period = 24  # 运行周期
     data.period_delta = 24 / data.period
@@ -429,13 +530,15 @@ def Data_read(
     data.scene.N = 3
     data.scene.N_day = np.array([360 / data.scene.N] * data.scene.N)
 
-    # Explicit 24-hour regulation-call magnitudes. Change these four values
+    # Explicit 24-hour regulation-call magnitudes. Change these six values
     # here when testing another call coefficient; hourly directions below are
     # intentionally kept unchanged.
     data.scene.HN_RU_call_coefficient = 0
     data.scene.HN_RD_call_coefficient = 0
     data.scene.BSS_TU_call_coefficient = 0
     data.scene.BSS_TD_call_coefficient = 0
+    data.scene.ES_RU_call_coefficient = 0
+    data.scene.ES_RD_call_coefficient = 0
     k_E_all = read_excel_range(filepath, '场景', 'B4:U27')
     k_H_all = read_excel_range(filepath, '场景', 'B32:U55')
     k_PV_all = read_excel_range(filepath, '场景', 'B60:U83')
@@ -452,7 +555,7 @@ def Data_read(
     data.cost.c_SO = 2
     data.cost.c_NO = 6
     data.cost.c_PV_q = 1
-    data.cost.c_lack = 3
+    data.cost.c_lack = 1
     # 价格变量
     var.cost.C_inv = model.addVars(data.year, lb=-GRB.INFINITY, vtype=GRB.CONTINUOUS, name="C_inv")
     var.cost.C_exp = model.addVars(data.year, lb=-GRB.INFINITY, vtype=GRB.CONTINUOUS, name="C_exp")
@@ -620,8 +723,6 @@ def Data_read(
     var.DN.R_demand = model.addVars(data.period, data.scene.N, data.year, lb=0, vtype=GRB.CONTINUOUS, name="DN_R_demand")
     var.DN.P_RU_lack = model.addVars(data.period, data.scene.N, data.year, lb=0, vtype=GRB.CONTINUOUS, name="DN_P_RU_lack")
     var.DN.P_RD_lack = model.addVars(data.period, data.scene.N, data.year, lb=0, vtype=GRB.CONTINUOUS, name="DN_P_RD_lack")
-    var.DN.u_RU_lack = model.addVars(data.period, data.scene.N, data.year, vtype=GRB.BINARY, name="DN_u_RU_lack")
-    var.DN.u_RD_lack = model.addVars(data.period, data.scene.N, data.year, vtype=GRB.BINARY, name="DN_u_RD_lack")
     # SVC运行变量
     var.SVC.Q = model.addVars(data.DN.N_node, data.period, data.scene.N, data.year, lb=-GRB.INFINITY, vtype=GRB.CONTINUOUS, name="SVC_Q")
 
@@ -683,6 +784,55 @@ def Data_read(
     data.ES.T_build = Table_ES3[3, 0]
     data.ES.k = Table_ES3[4, 0]
     data.ES.R_ir = (data.r * (1 + data.r) ** data.ES.T_life) / ((1 + data.r) ** data.ES.T_life - 1)
+
+    if data.period != 24:
+        raise ValueError('ES hourly call coefficients require exactly 24 periods')
+    es_ru_hourly = np.zeros(data.period, dtype=float)
+    es_rd_hourly = np.zeros(data.period, dtype=float)
+    es_ru_hourly[8:22] = float(data.scene.ES_RU_call_coefficient)
+    es_rd_hourly[:8] = float(data.scene.ES_RD_call_coefficient)
+    es_rd_hourly[22:] = float(data.scene.ES_RD_call_coefficient)
+
+    # An EES call is meaningful only where capacity already exists or may be
+    # installed. Keeping the coefficient support aligned with this node set
+    # also makes exported activation data unambiguous.
+    es_candidate_nodes = {int(node) for node in np.asarray(data.ES.place).ravel()}
+    data.ES.call_node_idx = tuple(
+        index
+        for index, node_id in enumerate(data.DN.node)
+        if float(data.ES.S[index]) > 1e-9 or int(node_id) in es_candidate_nodes
+    )
+    data.ES.call_node_set = set(data.ES.call_node_idx)
+    es_call_shape = (
+        data.DN.N_node,
+        data.period,
+        data.scene.N,
+        data.year,
+    )
+    data.ES.alpha_RU = np.zeros(es_call_shape, dtype=float)
+    data.ES.alpha_RD = np.zeros(es_call_shape, dtype=float)
+    for node in data.ES.call_node_idx:
+        for scene in range(data.scene.N):
+            for year in range(data.year):
+                data.ES.alpha_RU[node, :, scene, year] = es_ru_hourly
+                data.ES.alpha_RD[node, :, scene, year] = es_rd_hourly
+    data.ES.call_coefficient_mode = 'day_RU_night_RD'
+
+    # The physical upper bound of a charging/discharging power is the EES
+    # power capacity at that DN node. Candidate nodes can never exceed the
+    # annual system EES cap, while non-candidate nodes retain their fixed
+    # installed capacity. These bounds are used only in EES direction
+    # constraints and avoid a loose global big-M.
+    data.ES.power_big_m = np.zeros((data.DN.N_node, data.year), dtype=float)
+    es_total_cap = 0.1 * np.sum(np.asarray(data.PV.S, dtype=float), axis=0)
+    es_build_delay = int(data.ES.T_build)
+    for index, node_id in enumerate(data.DN.node):
+        is_candidate = int(node_id) in es_candidate_nodes
+        for year in range(data.year):
+            if is_candidate and year >= es_build_delay:
+                data.ES.power_big_m[index, year] = float(es_total_cap[year])
+            else:
+                data.ES.power_big_m[index, year] = float(data.ES.S[index])
 
     # ES 变量定义
     var.ES = Struct()
@@ -1359,4 +1509,6 @@ def Data_read(
     var.emission.NO = model.addVars(data.HN.N_station, data.period, data.scene.N, data.year, lb=0, vtype=GRB.CONTINUOUS, name="emission_NO")
 
     # 最后记得在整个函数末尾返回 data, var
+    _create_es_call_variables(model, data, var)
+    export_data_json(data, source_filepath=filepath)
     return data, var

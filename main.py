@@ -13,7 +13,6 @@ import sys
 
 
 _PROJECT_ROOT = Path(__file__).resolve().parent
-GENERAL_RESULT_ROOT = _PROJECT_ROOT / "results"
 _PROJECT_ROOT_IMPORT = chr(92) * 2 + "?" + chr(92) + str(_PROJECT_ROOT)
 for _path_entry in (str(_PROJECT_ROOT), _PROJECT_ROOT_IMPORT):
     if _path_entry not in sys.path:
@@ -23,17 +22,17 @@ import time
 
 import gurobipy as gp
 import numpy as np
-import scipy.io as sio
 from gurobipy import GRB
 
 from Constraints_DN import Constraints_DN
 from Constraints_ES import Constraints_ES
 from Constraints_PV import Constraints_PV
-from Constraints_BSS import Constraints_BSS
+from Constraints_BSS_manuscript import Constraints_BSS_manuscript
 from Data_export import Data_export
 from Data_read import Data_read, Struct
 from object import object
-from Constraints_HN import Constraints_HN_manuscript_exact_linear
+from Constraints_HN_manuscript_exact_linear import Constraints_HN_manuscript_exact_linear
+from project_paths import BSS_RESULT_ROOT, GENERAL_RESULT_ROOT, HN_RESULT_ROOT
 
 
 MAIN_PLANNING_YEARS = 10
@@ -68,32 +67,30 @@ def display_path(path):
     return text[4:] if text.startswith("\\\\?\\") else text
 
 
-def _mat_to_struct(value):
-    if hasattr(value, "_fieldnames"):
-        result = Struct()
-        for field in value._fieldnames:
-            setattr(result, field, _mat_to_struct(getattr(value, field)))
-        return result
-    if isinstance(value, np.ndarray):
-        if value.dtype == object:
-            return np.vectorize(_mat_to_struct, otypes=[object])(value)
-        if value.dtype.kind in "uib":
-            return value.astype(np.int64, copy=False)
-        return value
-    if isinstance(value, np.generic) and value.dtype.kind in "uib":
-        return int(value)
-    return value
+class _SchemeUnpickler(pickle.Unpickler):
+    """Load scheme pickles written by either NumPy 1.x or NumPy 2.x."""
+
+    _NUMPY2_ALIASES = {
+        "numpy._core": "numpy.core",
+        "numpy._core.multiarray": "numpy.core.multiarray",
+        "numpy._core._multiarray_umath": "numpy.core._multiarray_umath",
+    }
+
+    def find_class(self, module, name):
+        if module.startswith("numpy._core"):
+            module = "numpy.core" + module[len("numpy._core"):]
+        return super().find_class(self._NUMPY2_ALIASES.get(module, module), name)
 
 
 def load_scheme(path):
-    mat = sio.loadmat(windows_long_path(path), squeeze_me=True, struct_as_record=False)
-    return _mat_to_struct(mat["scheme"])
+    with windows_long_path(path).open("rb") as file:
+        return _SchemeUnpickler(file).load()
 
 
-def _convert_structure(value, target="json"):
+def _convert_structure(value):
     if isinstance(value, Struct) or hasattr(value, "__dict__"):
         return {
-            key: _convert_structure(item, target)
+            key: _convert_structure(item)
             for key, item in vars(value).items()
             if not key.startswith("_")
         }
@@ -101,80 +98,24 @@ def _convert_structure(value, target="json"):
         if value.dtype == object:
             converted = np.empty(value.shape, dtype=object)
             for index in np.ndindex(value.shape):
-                converted[index] = _convert_structure(value[index], target)
-            return converted.tolist() if target == "json" else converted
-        if target == "json":
-            return _convert_structure(value.tolist(), target)
-        return value
+                converted[index] = _convert_structure(value[index])
+            return converted.tolist()
+        return _convert_structure(value.tolist())
     if isinstance(value, dict):
-        if target == "matlab":
-            if not value:
-                return np.empty((0,), dtype=object)
-            keys = list(value)
-            if all(isinstance(key, (int, np.integer)) and int(key) >= 0 for key in keys):
-                shape = (max(int(key) for key in keys) + 1,)
-                return _indexed_dict_to_matlab_array(value, shape)
-            if all(
-                isinstance(key, tuple)
-                and key
-                and all(isinstance(index, (int, np.integer)) and int(index) >= 0 for index in key)
-                for key in keys
-            ):
-                dimensions = {len(key) for key in keys}
-                if len(dimensions) == 1:
-                    dimension_count = dimensions.pop()
-                    shape = tuple(
-                        max(int(key[axis]) for key in keys) + 1
-                        for axis in range(dimension_count)
-                    )
-                    return _indexed_dict_to_matlab_array(value, shape)
-            return {
-                _matlab_field_name(key): _convert_structure(item, target)
-                for key, item in value.items()
-            }
-        return {str(key): _convert_structure(item, target) for key, item in value.items()}
+        return {str(key): _convert_structure(item) for key, item in value.items()}
     if isinstance(value, (np.integer, np.floating)):
         value = value.item()
     elif isinstance(value, np.bool_):
         value = bool(value)
     elif isinstance(value, (list, tuple)):
-        converted = [_convert_structure(item, target) for item in value]
-        return converted if target == "json" else np.asarray(converted, dtype=object)
-    if target == "json" and isinstance(value, float) and not math.isfinite(value):
+        return [_convert_structure(item) for item in value]
+    if isinstance(value, float) and not math.isfinite(value):
         return None
     return value
 
 
-def _indexed_dict_to_matlab_array(values, shape):
-    converted = np.empty(shape, dtype=object)
-    converted.fill(None)
-    scalar_numeric = True
-    for key, item in values.items():
-        index = tuple(int(part) for part in key) if isinstance(key, tuple) else int(key)
-        converted_item = _convert_structure(item, "matlab")
-        converted[index] = converted_item
-        scalar_numeric = scalar_numeric and isinstance(
-            converted_item, (int, float, complex, np.number, bool)
-        )
-    if scalar_numeric and all(item is not None for item in converted.flat):
-        return np.asarray(converted.tolist())
-    return converted
-
-
-def _matlab_field_name(key):
-    text = str(key)
-    if text and text[0].isalpha() and all(character.isalnum() or character == "_" for character in text):
-        return text
-    safe = "".join(character if character.isalnum() or character == "_" else "_" for character in text)
-    return f"field_{safe}"
-
-
-def _matlab_ready(value):
-    return _convert_structure(value, "matlab")
-
-
 def _json_ready(value):
-    return _convert_structure(value, "json")
+    return _convert_structure(value)
 
 
 def _safe_model_attr(model, attr):
@@ -364,17 +305,6 @@ def save_run_outputs(output_dir, model, result=None, scheme=None, elapsed_second
         with cost_path.open("w", encoding="utf-8") as cost_file:
             json.dump(_cost_summary(result), cost_file, ensure_ascii=False, indent=2)
         metadata["files"]["cost_summary"] = cost_path.name
-        try:
-            mat_path = output_dir / "result_scheme.mat"
-            sio.savemat(
-                mat_path,
-                {"result": _matlab_ready(result), "scheme": _matlab_ready(scheme)},
-                long_field_names=True,
-                do_compression=True,
-            )
-            metadata["files"]["mat"] = mat_path.name
-        except Exception as error:
-            metadata["mat_export_error"] = str(error)
         if int(_safe_model_attr(model, "SolCount") or 0) > 0:
             solution_path = output_dir / "solution.sol"
             solution_error = safe_gurobi_write(model, solution_path)
@@ -393,12 +323,25 @@ def save_flexibility_snapshot(output_dir, data, var, result=None):
     n_year, n_scene, n_time = int(data.year), int(data.scene.N), int(data.period)
     n_station = int(hn.N_station)
     n_node = int(hn.N_node)
+    n_es_node = int(data.DN.N_node)
     n_pipe = int(hn.N_pipe)
 
     def values(variable, shape):
         array = np.zeros(shape, dtype=float)
         for index in np.ndindex(shape):
             array[index] = float(variable[index].X)
+        return array
+
+    def es_called_values(variable, base_variable):
+        """Return dense EES call snapshots while retaining sparse solver variables."""
+        array = values(base_variable, (n_es_node, n_time, n_scene, n_year))
+        for node in data.ES.call_node_idx:
+            for time in range(n_time):
+                for scene in range(n_scene):
+                    for year in range(n_year):
+                        array[node, time, scene, year] = float(
+                            variable[node, time, scene, year].X
+                        )
         return array
 
     arrays = {
@@ -414,6 +357,14 @@ def save_flexibility_snapshot(output_dir, data, var, result=None):
         "t_return_node": values(var.HN.T_R_node, (n_node, n_time, n_scene, n_year)),
         "h_ru": values(var.HN.H_RU, (n_station, n_time, n_scene, n_year)),
         "h_rd": values(var.HN.H_RD, (n_station, n_time, n_scene, n_year)),
+        "es_power": values(var.ES.P, (n_es_node, n_time, n_scene, n_year)),
+        "es_power_call": es_called_values(var.ES.P_call, var.ES.P),
+        "es_soc": values(var.ES.E, (n_es_node, n_time, n_scene, n_year)),
+        "es_soc_call": es_called_values(var.ES.E_call, var.ES.E),
+        "es_power_ru": values(var.ES.P_RU, (n_es_node, n_time, n_scene, n_year)),
+        "es_power_rd": values(var.ES.P_RD, (n_es_node, n_time, n_scene, n_year)),
+        "es_alpha_ru": np.asarray(data.ES.alpha_RU, dtype=float).copy(),
+        "es_alpha_rd": np.asarray(data.ES.alpha_RD, dtype=float).copy(),
         "hn_power_ru_all": values(var.HN.P_RU_all, (n_time, n_scene, n_year)),
         "hn_power_rd_all": values(var.HN.P_RD_all, (n_time, n_scene, n_year)),
         "pipe_built": values(var.HN.y_pipe, (n_pipe, n_year)),
@@ -492,27 +443,25 @@ def save_flexibility_snapshot(output_dir, data, var, result=None):
 
 def default_scheme_path():
     project_dir = windows_long_path(Path(__file__).resolve().parent)
-    search_roots = (project_dir, project_dir.parent, project_dir.parent.parent)
+    # Run outputs also contain scheme.pkl; keep them out of the input search.
+    result_roots = (GENERAL_RESULT_ROOT, HN_RESULT_ROOT, BSS_RESULT_ROOT)
     candidates = []
-    for root in search_roots:
-        candidates.extend(root.rglob("scheme_*.mat"))
+    for candidate in project_dir.rglob("scheme*.pkl"):
+        candidate_text = display_path(candidate)
+        if any(Path(candidate_text).is_relative_to(root_) for root_ in result_roots):
+            continue
+        candidates.append(candidate)
     if candidates:
         return sorted(candidates)[0]
-    raise FileNotFoundError("Default scheme MAT file not found; pass scheme_file explicitly")
+    raise FileNotFoundError("Default scheme pickle file not found; pass scheme_file explicitly")
 
 
 def default_parameter_path():
     project_dir = Path(__file__).resolve().parent
-    candidates = [project_dir / "parameters.json"]
-    candidates.extend(
-        path for path in project_dir.glob("*.xlsx") if not path.name.startswith("~$")
-    )
-    candidates = [path for path in candidates if path.is_file()]
+    candidates = [path for path in project_dir.glob("*.xlsx") if not path.name.startswith("~$")]
     if candidates:
         return sorted(candidates)[0]
-    raise FileNotFoundError(
-        "Default parameter JSON/XLSX file not found; pass parameter_file explicitly"
-    )
+    raise FileNotFoundError("Default parameter XLSX file not found; pass parameter_file explicitly")
 
 
 def apply_gurobi_time_limit(model, time_limit):
@@ -629,7 +578,7 @@ def run_two_stage_planning(
     solver_integer_feasibility_tol=1e-5,
     solver_optimality_tol=1e-6,
     hn_builder=Constraints_HN_manuscript_exact_linear,
-    bss_builder=Constraints_BSS,
+    bss_builder=Constraints_BSS_manuscript,
     flexibility_penalty_lower_bound=None,
 ):
     """Optimize F1 planning decisions, then F operation costs with them fixed."""
@@ -741,7 +690,6 @@ def run_two_stage_planning(
     )
     result.two_stage.fixed_planning_variable_count = fixed_count
     result.two_stage.planning_values_file = "stage1_planning_values.pkl"
-    result.BSS.integer_tube["formulation"] = bss_builder.__name__
 
     globals()["result"] = result
     globals()["scheme"] = export_scheme
@@ -799,7 +747,7 @@ def run_planning(
     fixed_planning_values=None,
     objective_field="F",
     hn_builder=Constraints_HN_manuscript_exact_linear,
-    bss_builder=Constraints_BSS,
+    bss_builder=Constraints_BSS_manuscript,
     dn_builder=Constraints_DN,
 ):
     """Build and solve the physical exact-linear heat-network MILP."""
@@ -921,7 +869,6 @@ def run_planning(
     export_scheme = None
     if model.status == GRB.OPTIMAL or model.SolCount > 0:
         result, export_scheme = Data_export(data, var, objective)
-        result.BSS.integer_tube["formulation"] = bss_builder.__name__
         accuracy = {
             "evidence_type": "physical_exact_linear_solution",
             "planning_years": int(data.year),

@@ -3,6 +3,15 @@ from gurobipy import GRB
 
 
 def Constraints_DN(model, data, var, scheme=None, include_bss_reserve=True):
+    # The shortage variables use an epigraph formulation. A strictly positive
+    # shortage penalty in the minimization objective makes the lower bounds
+    # below attain max(R_demand - P_R*, 0) without binary big-M constraints.
+    if float(data.cost.c_lack) <= 0:
+        raise ValueError(
+            "DN shortage epigraph requires data.cost.c_lack > 0 "
+            "to preserve the exact shortage definition"
+        )
+
     # =========================================================================
     # 0. 预设方案约束 (如果传入了 scheme，将其变量固定)
     # =========================================================================
@@ -145,7 +154,15 @@ def Constraints_DN(model, data, var, scheme=None, include_bss_reserve=True):
                         model.addConstr(var.DN.P_node[i, t, s, y] >= 0, name=f"DN_P_sub_lb_{i}_{t}_{s}_{y}")
                         model.addConstr(var.DN.P_node[i, t, s, y] <= var.DN.S_node[i, y] * data.DN.k_sub, name=f"DN_P_sub_ub_{i}_{t}_{s}_{y}")
                     else:
-                        model.addConstr(var.DN.P_node[i, t, s, y] == -var.DN.P_load[i, t, s, y] + var.PV.P[i, t, s, y] - var.ES.P[i, t, s, y] - var.HN.P_DN[i, t, s, y] - var.BSS.P_DN[i, t, s, y], name=f"DN_P_node_dist_{i}_{t}_{s}_{y}")
+                        # Only EES-capable nodes own a sparse called-power
+                        # variable. At every other node the base EES power is
+                        # identically zero by its capacity constraints.
+                        es_power = (
+                            var.ES.P_call[i, t, s, y]
+                            if i in data.ES.call_node_set
+                            else var.ES.P[i, t, s, y]
+                        )
+                        model.addConstr(var.DN.P_node[i, t, s, y] == -var.DN.P_load[i, t, s, y] + var.PV.P[i, t, s, y] - es_power - var.HN.P_DN[i, t, s, y] - var.BSS.P_DN[i, t, s, y], name=f"DN_P_node_dist_{i}_{t}_{s}_{y}")
                         # 负荷节点变压器容量限制 (考虑允许一定比例的功率倒送 k_back)
                         model.addConstr(var.DN.P_node[i, t, s, y] >= -var.DN.S_node[i, y] * data.DN.k_sub, name=f"DN_P_node_lb_{i}_{t}_{s}_{y}")
                         model.addConstr(var.DN.P_node[i, t, s, y] <= var.DN.S_node[i, y] * data.DN.k_sub, name=f"DN_P_node_ub_{i}_{t}_{s}_{y}")
@@ -181,11 +198,9 @@ def Constraints_DN(model, data, var, scheme=None, include_bss_reserve=True):
                     name=f"DN_P_RU_{t}_{s}_{y}",
                 )
 
-                # 上调能力不足量计算 R_u_lack = max{R_demand - P_RU, 0}
+                # Positive shortage cost makes this epigraph attain
+                # R_u_lack = max(R_demand - P_RU, 0) at every optimum.
                 model.addConstr(var.DN.P_RU_lack[t, s, y] >= var.DN.R_demand[t, s, y] - var.DN.P_RU[t, s, y], name=f"DN_RU_lack_1_{t}_{s}_{y}")
-                model.addConstr(var.DN.P_RU_lack[t, s, y] >= 0, name=f"DN_RU_lack_2_{t}_{s}_{y}")
-                model.addConstr(var.DN.P_RU_lack[t, s, y] <= var.DN.R_demand[t, s, y] - var.DN.P_RU[t, s, y] + var.DN.u_RU_lack[t, s, y] * data.M, name=f"DN_RU_lack_3_{t}_{s}_{y}")
-                model.addConstr(var.DN.P_RU_lack[t, s, y] <= (1 - var.DN.u_RU_lack[t, s, y]) * data.M, name=f"DN_RU_lack_4_{t}_{s}_{y}")
 
                 # DN uses nominal downward reserve capability as well.
                 reserve_rd = var.BSS.P_RD_all[t, s, y] if include_bss_reserve else 0
@@ -196,10 +211,8 @@ def Constraints_DN(model, data, var, scheme=None, include_bss_reserve=True):
                     + reserve_rd,
                     name=f"DN_P_RD_{t}_{s}_{y}",
                 )
-                # 下调能力不足量计算 R_d_lack = max{R_demand - P_RD, 0}
+                # The variable lower bound enforces nonnegativity, while the
+                # positive objective penalty yields the exact downward max.
                 model.addConstr(var.DN.P_RD_lack[t, s, y] >= var.DN.R_demand[t, s, y] - var.DN.P_RD[t, s, y], name=f"DN_RD_lack_1_{t}_{s}_{y}")
-                model.addConstr(var.DN.P_RD_lack[t, s, y] >= 0, name=f"DN_RD_lack_2_{t}_{s}_{y}")
-                model.addConstr(var.DN.P_RD_lack[t, s, y] <= var.DN.R_demand[t, s, y] - var.DN.P_RD[t, s, y] + var.DN.u_RD_lack[t, s, y] * data.M, name=f"DN_RD_lack_3_{t}_{s}_{y}")
-                model.addConstr(var.DN.P_RD_lack[t, s, y] <= (1 - var.DN.u_RD_lack[t, s, y]) * data.M, name=f"DN_RD_lack_4_{t}_{s}_{y}")
 
     return model

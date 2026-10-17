@@ -12,6 +12,7 @@ def Constraints_PV(model, data, var, scheme=None):
             # 规划容量 = 规划数量 * 单台步长
             model.addConstr(var.PV.S_plan[k, y] == var.PV.N_plan[k, y] * data.PV.S_ref, name=f"PV_S_plan_calc_{k}_{y}")
 
+            # 原 MATLAB 代码中有一句 var.PV.N_plan == 0，代表此配置下不新增光伏
             model.addConstr(var.PV.N_plan[k, y] == 0, name=f"PV_N_plan_zero_{k}_{y}")
 
             # 建设容量上限约束
